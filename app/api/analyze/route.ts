@@ -1,101 +1,85 @@
 import OpenAI from "openai";
+import { NextRequest, NextResponse } from "next/server";
 
-type AnalyzeRequestBody = {
-  log?: string;
-  gameTitle?: string;
-  gpuModel?: string;
-  driverVersion?: string;
-  apiMode?: "Auto Detect" | "DX11" | "DX12" | "Vulkan";
-};
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
-export async function POST(req: Request) {
+// Simple in-memory IP limiter
+const dailyLimits: Record<string, { count: number; date: string }> = {};
+const DAILY_LIMIT = 3;
+
+function today() {
+  const d = new Date();
+  return d.toISOString().split("T")[0];
+}
+
+export async function POST(req: NextRequest) {
   try {
-    const body = (await req.json()) as AnalyzeRequestBody;
+    const ip =
+      req.headers.get("x-forwarded-for")?.split(",")[0] ||
+      "unknown-ip";
 
-    const log = body?.log?.trim();
-    const gameTitle = body?.gameTitle?.trim();
-    const gpuModel = body?.gpuModel?.trim();
-    const driverVersion = body?.driverVersion?.trim();
-    const apiMode = body?.apiMode?.trim();
+    const todayStr = today();
 
-    if (!log) {
-      return new Response(JSON.stringify({ error: "No crash log provided." }), {
-        status: 400,
-      });
+    if (!dailyLimits[ip] || dailyLimits[ip].date !== todayStr) {
+      dailyLimits[ip] = { count: 0, date: todayStr };
     }
 
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      return new Response(
-        JSON.stringify({ error: "OPENAI_API_KEY is missing from .env.local" }),
-        { status: 500 }
+    if (dailyLimits[ip].count >= DAILY_LIMIT) {
+      return NextResponse.json(
+        { error: "Daily limit reached. Upgrade for unlimited diagnostics." },
+        { status: 429 }
       );
     }
 
-    const openai = new OpenAI({ apiKey });
+    dailyLimits[ip].count++;
 
-    const systemPrompt =
-      "You are an expert PC gaming crash troubleshooting assistant. You diagnose crash logs and provide likely causes with probabilities and concrete fix steps.";
+    const body = await req.json();
+    const { log, gameTitle, gpuModel, driverVersion, apiMode } = body;
 
-    const userPrompt = `
-You are a professional PC gaming crash analyst.
+    if (!log) {
+      return NextResponse.json({ error: "No crash log provided." }, { status: 400 });
+    }
 
-Always respond in this EXACT format (use the headings exactly):
+    const prompt = `
+You are an advanced GPU crash diagnostic engine.
 
-Quick Fix First:
-- (3 bullets max: fastest high-impact fixes first)
+Context:
+Game: ${gameTitle}
+GPU: ${gpuModel}
+Driver Version: ${driverVersion}
+Graphics API Mode: ${apiMode}
 
-Issue:
-(1–2 sentence summary of what the error likely means)
-
-Confidence Level:
-(Low / Medium / High)
-
-Probability Breakdown:
-- Driver/software issue: __%
-- Overheating/thermal: __%
-- API conflict (DX11/DX12/Vulkan): __%
-- Power/PSU/unstable clocks: __%
-- Hardware failure: __%
-(Percentages must sum to 100)
-
-Most Likely Cause:
-- (bullets)
-
-Recommended Fix Steps:
-1. (numbered steps, clear actions)
-
-Need More Info:
-- (ONLY if information is insufficient)
-
-Context (if provided):
-- Game: ${gameTitle || "Unknown"}
-- GPU: ${gpuModel || "Unknown"}
-- Driver: ${driverVersion || "Unknown"}
-- Graphics API Mode: ${apiMode || "Unknown"}
-
-Crash Log / Error:
+Crash Log:
 ${log}
-`.trim();
+
+Provide:
+
+Quick Fix First
+Issue
+Confidence Level
+Probability Breakdown (percentages totaling 100%)
+Most Likely Cause
+Recommended Fix Steps
+Need More Info
+`;
 
     const completion = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      temperature: 0.2,
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.3,
     });
 
-    const result = completion.choices?.[0]?.message?.content ?? "";
+    const result = completion.choices[0].message.content;
 
-    return new Response(JSON.stringify({ result }), { status: 200 });
-  } catch (error: unknown) {
-    console.error("🔥 OPENAI ERROR:", error);
+    return NextResponse.json({ result });
 
-    const message =
-      error instanceof Error ? error.message : "Unknown server error";
-
-    return new Response(JSON.stringify({ error: message }), { status: 500 });
+  } catch (error) {
+    console.error(error);
+    return NextResponse.json(
+      { error: "Internal server error." },
+      { status: 500 }
+    );
   }
 }
