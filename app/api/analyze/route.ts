@@ -54,15 +54,14 @@ Graphics API Mode: ${apiMode}
 Crash Log:
 ${log}
 
-Provide:
-
-Quick Fix First
-Issue
-Confidence Level
-Probability Breakdown (percentages totaling 100%)
-Most Likely Cause
-Recommended Fix Steps
-Need More Info
+Provide the following sections as plain text (no markdown, no ###, no bullet symbols like **):
+Quick Fix First:
+Issue:
+Confidence Level:
+Probability Breakdown (must total 100%):
+Most Likely Cause:
+Recommended Fix Steps:
+Need More Info:
 `;
 
     const completion = await openai.chat.completions.create({
