@@ -10,11 +10,11 @@
   },
   "dependencies": {
     "@stripe/stripe-js": "^8.8.0",
-    "@vercel/kv": "^3.0.0",
     "next": "16.1.6",
     "openai": "^6.22.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",
+    "redis": "^5.11.0",
     "stripe": "^20.4.0",
     "zod": "^4.3.6"
   },

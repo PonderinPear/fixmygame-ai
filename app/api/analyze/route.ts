@@ -1,6 +1,8 @@
 import OpenAI from "openai";
 import { NextRequest, NextResponse } from "next/server";
-import { kv } from "@vercel/kv";
+import { getRedis } from "@/lib/redis";
+
+export const runtime = "nodejs";
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -9,7 +11,7 @@ const openai = new OpenAI({
 const DAILY_LIMIT = 3;
 
 function today() {
-  return new Date().toISOString().slice(0, 10);
+  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 }
 
 function getClientKey(req: NextRequest) {
@@ -21,16 +23,34 @@ function getClientKey(req: NextRequest) {
 
   if (ip) return `ip:${ip}`;
   if (cookieVid) return `vid:${cookieVid}`;
-
   return `unknown:${crypto.randomUUID()}`;
 }
 
-async function incrementAndCheckDailyLimit(clientKey: string) {
-  const key = `limit:${today()}:${clientKey}`;
-  const count = (await kv.incr(key)) as number;
+async function getRemaining(req: NextRequest) {
+  const isPro = req.cookies.get("fmg_pro")?.value === "1";
+  if (isPro) return { isPro: true, remaining: Infinity };
 
+  const clientKey = getClientKey(req);
+  const key = `limit:${today()}:${clientKey}`;
+
+  const redis = await getRedis();
+  const currentRaw = await redis.get(key);
+  const current = currentRaw ? Number(currentRaw) : 0;
+
+  const remaining = Math.max(0, DAILY_LIMIT - current);
+  return { isPro: false, remaining };
+}
+
+async function incrementAndGetCount(req: NextRequest) {
+  const clientKey = getClientKey(req);
+  const key = `limit:${today()}:${clientKey}`;
+
+  const redis = await getRedis();
+  const count = await redis.incr(key);
+
+  // expire after 48 hours
   if (count === 1) {
-    await kv.expire(key, 60 * 60 * 48);
+    await redis.expire(key, 60 * 60 * 48);
   }
 
   return count;
@@ -38,40 +58,55 @@ async function incrementAndCheckDailyLimit(clientKey: string) {
 
 export async function POST(req: NextRequest) {
   try {
-    // KV rate limiting
-    const clientKey = getClientKey(req);
-    const count = await incrementAndCheckDailyLimit(clientKey);
+    const isPro = req.cookies.get("fmg_pro")?.value === "1";
 
-    if (count > DAILY_LIMIT) {
-      return NextResponse.json(
-        { error: "Daily limit reached. Upgrade for unlimited diagnostics." },
-        { status: 429 }
-      );
+    // Enforce free limit if not Pro
+    let count = 0;
+    if (!isPro) {
+      count = await incrementAndGetCount(req);
+      if (count > DAILY_LIMIT) {
+        return NextResponse.json(
+          { error: "Daily limit reached.", remaining: 0, isPro: false },
+          { status: 429 }
+        );
+      }
     }
 
     const body = await req.json();
-    const { log, gameTitle, gpuModel, driverVersion, apiMode } = body;
+    const { log, gameTitle, gpuModel, driverVersion, apiMode } = body ?? {};
 
-    if (!log) {
+    if (!log || typeof log !== "string" || !log.trim()) {
+      const remainingInfo = await getRemaining(req);
       return NextResponse.json(
-        { error: "No crash log provided." },
+        { error: "No crash log provided.", ...remainingInfo },
         { status: 400 }
       );
     }
 
     const prompt = `
-You are an advanced GPU crash diagnostic engine.
+You are an advanced crash diagnostic engine specialized in MODDED PC games.
+
+You understand:
+- Forge logs
+- Fabric logs
+- CurseForge modpacks
+- Dependency conflicts
+- Missing mods
+- Loader version mismatches
+- Mixin failures
+- GPU driver instability
 
 Context:
-Game: ${gameTitle}
-GPU: ${gpuModel}
-Driver Version: ${driverVersion}
-Graphics API Mode: ${apiMode}
+Game: ${gameTitle ?? ""}
+GPU: ${gpuModel ?? ""}
+Driver Version: ${driverVersion ?? ""}
+Graphics API Mode: ${apiMode ?? ""}
 
 Crash Log:
 ${log}
 
-Provide the following sections as plain text (no markdown, no ###, no bullet symbols):
+Provide the following sections as plain text (no markdown, no ###):
+
 Quick Fix First:
 Issue:
 Confidence Level:
@@ -79,6 +114,8 @@ Probability Breakdown (must total 100%):
 Most Likely Cause:
 Recommended Fix Steps:
 Need More Info:
+
+If the crash appears mod-related, prioritize mod conflict analysis over hardware causes.
 `;
 
     const completion = await openai.chat.completions.create({
@@ -87,11 +124,15 @@ Need More Info:
       temperature: 0.3,
     });
 
-    const result = completion.choices[0].message.content;
+    const result = completion.choices[0]?.message?.content ?? "No result.";
 
-    const res = NextResponse.json({ result });
+    // Set fallback cookie ID if missing (helps tracking)
+    const res = NextResponse.json({
+      result,
+      isPro,
+      remaining: isPro ? Infinity : Math.max(0, DAILY_LIMIT - count),
+    });
 
-    // Set fallback cookie ID if missing
     if (!req.cookies.get("vid")) {
       res.cookies.set("vid", crypto.randomUUID(), {
         httpOnly: true,
@@ -103,7 +144,6 @@ Need More Info:
     }
 
     return res;
-
   } catch (error) {
     console.error(error);
     return NextResponse.json(

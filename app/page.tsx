@@ -1,293 +1,343 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 
-type ApiMode = "Auto Detect" | "DX11" | "DX12" | "Vulkan";
+type LimitResponse = {
+  isPro: boolean;
+  remaining: number;
+  limit: number;
+};
 
-const DAILY_LIMIT = 3;
+type AnalyzeResponse = {
+  result: string;
+};
 
-function todayKey() {
-  const d = new Date();
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
+type CheckoutResponse = {
+  url: string;
+};
+type ApiErrorShape = {
+  error?: string;
+  message?: string;
+};
+
+function isApiErrorShape(x: unknown): x is ApiErrorShape {
+  return typeof x === "object" && x !== null;
 }
 
-function parseProbabilityBreakdown(text: string) {
-  // Looks for:
-  // Probability Breakdown:
-  // - Driver/software issue: 60%
-  // - Overheating/thermal: 15%
-  // ...
-  const lines = text.split("\n").map((l) => l.trim());
-  const startIdx = lines.findIndex((l) =>
-    l.toLowerCase().startsWith("probability breakdown:")
-  );
-  if (startIdx === -1) return null;
+async function fetchJSON<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
+  const res = await fetch(input, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(init?.headers ?? {}),
+    },
+  });
 
-  const probs: { label: string; value: number }[] = [];
-  for (let i = startIdx + 1; i < Math.min(lines.length, startIdx + 15); i++) {
-    const line = lines[i];
-    if (!line.startsWith("-")) break;
+  const text = await res.text();
 
-    // Example: "- Driver/software issue: 60%"
-    const match = line.match(/^-+\s*(.+?):\s*(\d{1,3})%/i);
-    if (!match) continue;
-
-    const label = match[1].trim();
-    const value = Number(match[2]);
-    if (!Number.isFinite(value)) continue;
-
-    probs.push({ label, value });
+  let parsed: unknown = null;
+  if (text.trim().length > 0) {
+    try {
+      parsed = JSON.parse(text) as unknown;
+    } catch {
+      parsed = null;
+    }
   }
 
-  if (probs.length === 0) return null;
+  if (!res.ok) {
+    let message = `Request failed (${res.status})`;
 
-  probs.sort((a, b) => b.value - a.value);
-  return {
-    top: probs[0],
-    all: probs,
-  };
+    if (isApiErrorShape(parsed)) {
+      if (typeof parsed.error === "string" && parsed.error.trim().length > 0) {
+        message = parsed.error;
+      } else if (typeof parsed.message === "string" && parsed.message.trim().length > 0) {
+        message = parsed.message;
+      }
+    } else if (text.trim().length > 0) {
+      message = text.slice(0, 300);
+    }
+
+    throw new Error(message);
+  }
+
+  if (parsed === null) {
+    throw new Error("Server returned an empty response.");
+  }
+
+  return parsed as T;
 }
 
-export default function Home() {
-  const [gameTitle, setGameTitle] = useState("");
-  const [gpuModel, setGpuModel] = useState("");
-  const [driverVersion, setDriverVersion] = useState("");
-  const [apiMode, setApiMode] = useState<ApiMode>("Auto Detect");
-  const [log, setLog] = useState("");
+export default function Page() {
+  const [gameTitle, setGameTitle] = useState("Minecraft (Modded)");
+  const [gpuModel, setGpuModel] = useState("RTX 3060");
+  const [driverVersion, setDriverVersion] = useState("551.86");
+  const [graphicsApiMode, setGraphicsApiMode] = useState("Auto Detect");
+  const [crashLog, setCrashLog] = useState("");
 
-  const [result, setResult] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [isPro, setIsPro] = useState(false);
+  const [limit, setLimit] = useState(3);
+  const [remaining, setRemaining] = useState(3);
 
-  // Daily limiter state
-  const [runsToday, setRunsToday] = useState(0);
+  const [loadingLimit, setLoadingLimit] = useState(true);
+  const [running, setRunning] = useState(false);
+  const [result, setResult] = useState<string>("");
+  const [errorMsg, setErrorMsg] = useState<string>("");
+
+  const canRun = useMemo(() => isPro || remaining > 0, [isPro, remaining]);
 
   useEffect(() => {
-    // Initialize / reset daily counter
-    const key = "fmg_runs";
-    const raw = localStorage.getItem(key);
-    const parsed = raw ? (JSON.parse(raw) as { date: string; count: number }) : null;
+    let cancelled = false;
 
-    const today = todayKey();
+    async function loadLimit() {
+      setLoadingLimit(true);
+      try {
+        const data = await fetchJSON<LimitResponse>("/api/limit", { method: "GET" });
+        if (cancelled) return;
 
-    if (!parsed || parsed.date !== today) {
-      const fresh = { date: today, count: 0 };
-      localStorage.setItem(key, JSON.stringify(fresh));
-      setRunsToday(0);
-    } else {
-      setRunsToday(parsed.count ?? 0);
+        setIsPro(Boolean(data.isPro));
+        setLimit(Number.isFinite(data.limit) ? data.limit : 3);
+        setRemaining(Number.isFinite(data.remaining) ? data.remaining : 3);
+      } catch {
+        // If /api/limit fails locally, don't break the UI
+        if (cancelled) return;
+        setIsPro(false);
+        setLimit(3);
+        setRemaining(3);
+      } finally {
+        if (!cancelled) setLoadingLimit(false);
+      }
     }
+    
+
+    loadLimit();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  const remaining = Math.max(0, DAILY_LIMIT - runsToday);
-  const isLimited = remaining <= 0;
+  function showCrashLogHelp() {
+    alert(
+      `Minecraft (CurseForge/Forge/Fabric):
+- Instance folder > logs/latest.log
+- Instance folder > crash-reports/*.txt
 
-  const prob = useMemo(() => parseProbabilityBreakdown(result), [result]);
-
-  async function incrementRunCount() {
-    const key = "fmg_runs";
-    const today = todayKey();
-    const raw = localStorage.getItem(key);
-    const parsed = raw ? (JSON.parse(raw) as { date: string; count: number }) : null;
-
-    const count =
-      parsed && parsed.date === today && Number.isFinite(parsed.count)
-        ? parsed.count
-        : 0;
-
-    const next = { date: today, count: count + 1 };
-    localStorage.setItem(key, JSON.stringify(next));
-    setRunsToday(next.count);
+CurseForge app:
+Open the modpack > ... > Open Folder`
+    );
   }
 
-  async function handleAnalyze() {
-    if (loading) return;
+  async function runDiagnostic() {
+    setErrorMsg("");
+    setResult("");
 
-    // limiter (free tier)
-    if (isLimited) {
-      setResult(
-        "Daily limit reached (3 free diagnostics/day). Upgrade for unlimited diagnostics."
-      );
+    if (!crashLog.trim()) {
+      setErrorMsg("Paste a crash log / error first.");
       return;
     }
 
-    setLoading(true);
-    setResult("");
+    if (!canRun) {
+      setErrorMsg("Daily limit reached. Upgrade to Pro for unlimited diagnostics.");
+      return;
+    }
 
+    setRunning(true);
     try {
-      const res = await fetch("/api/analyze", {
+      const payload = {
+        gameTitle,
+        gpuModel,
+        driverVersion,
+        graphicsApiMode,
+        crashLog,
+      };
+
+      const data = await fetchJSON<AnalyzeResponse>("/api/analyze", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          log,
-          gameTitle,
-          gpuModel,
-          driverVersion,
-          apiMode,
-        }),
+        body: JSON.stringify(payload),
       });
 
-      const data: unknown = await res.json();
-
-      if (
-        typeof data === "object" &&
-        data !== null &&
-        "result" in data &&
-        typeof (data as { result: string }).result === "string"
-      ) {
-        await incrementRunCount();
-        setResult((data as { result: string }).result);
-      } else if (
-        typeof data === "object" &&
-        data !== null &&
-        "error" in data &&
-        typeof (data as { error: string }).error === "string"
-      ) {
-        setResult("Error: " + (data as { error: string }).error);
-      } else {
-        setResult("Unexpected response.");
-      }
-    } catch (err: unknown) {
-      console.error(err);
-      setResult("Error calling API.");
+      setResult(data.result || "");
+      // refresh limit after a run (server is source of truth)
+      const lim = await fetchJSON<LimitResponse>("/api/limit", { method: "GET" });
+      setIsPro(Boolean(lim.isPro));
+      setLimit(Number.isFinite(lim.limit) ? lim.limit : 3);
+      setRemaining(Number.isFinite(lim.remaining) ? lim.remaining : 0);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Diagnostic failed.";
+      setErrorMsg(msg);
     } finally {
-      setLoading(false);
+      setRunning(false);
+    }
+  }
+
+  async function upgradeToPro() {
+    setErrorMsg("");
+    try {
+      const data = await fetchJSON<CheckoutResponse>("/api/checkout", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+
+      if (!data.url) {
+        throw new Error("Checkout failed.");
+      }
+
+      window.location.href = data.url;
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Checkout failed.";
+      setErrorMsg(msg);
+      alert("Checkout failed.");
     }
   }
 
   return (
-    <main className="min-h-screen flex items-start justify-center px-6 py-10 text-white bg-black">
-      <div className="w-full max-w-2xl">
-        <div className="rounded-2xl border border-slate-800 bg-gradient-to-b from-slate-950 to-black p-8 shadow-[0_0_40px_rgba(0,0,0,0.6)]">
-          <h1 className="text-4xl font-extrabold tracking-tight">
-            FixMyGame AI
-          </h1>
-          <p className="mt-2 text-slate-300">
-            GPU crash & driver diagnostic engine
-          </p>
+    <main className="mx-auto w-full max-w-[900px] px-4 py-12 text-white">
+      <h1 className="text-4xl font-extrabold tracking-tight">AI Crash Analyzer for Modded PC Games</h1>
+      <p className="mt-3 max-w-3xl text-white/80">
+        Diagnose Forge, Fabric, and CurseForge crash logs. Detect mod conflicts, dependency issues, loader mismatches, and
+        GPU/driver faults.
+      </p>
 
-          <div className="mt-8 space-y-5">
+      <section className="mt-10 rounded-2xl border border-white/10 bg-[rgba(10,22,48,0.55)] p-5">
+        <div className="grid gap-4">
+          <Field label="GAME TITLE">
+            <input
+              className="w-full rounded-xl border border-white/10 bg-black/30 px-4 py-3 outline-none focus:border-white/20"
+              value={gameTitle}
+              onChange={(e) => setGameTitle(e.target.value)}
+              placeholder="Minecraft (Modded), Warzone, Tarkov..."
+            />
+          </Field>
+
+          <Field label="GPU MODEL">
+            <input
+className="w-full rounded-xl border border-white/10 bg-black/30 px-4 py-3 outline-none focus:border-white/20"              value={gpuModel}
+              onChange={(e) => setGpuModel(e.target.value)}
+              placeholder="RTX 3070 / RX 6800"
+            />
+          </Field>
+
+          <Field label="DRIVER VERSION">
+            <input
+              className="w-full rounded-xl border border-white/10 bg-black/30 px-4 py-3 outline-none focus:border-white/20"
+              value={driverVersion}
+              onChange={(e) => setDriverVersion(e.target.value)}
+              placeholder="551.86"
+            />
+          </Field>
+
+          <Field label="GRAPHICS API MODE">
+            <select
+  aria-label="Graphics API Mode"
+  className="..."
+  value={graphicsApiMode}
+  onChange={(e) => setGraphicsApiMode(e.target.value)}
+>
+              <option>Auto Detect</option>
+              <option>DirectX 11</option>
+              <option>DirectX 12</option>
+              <option>Vulkan</option>
+              <option>OpenGL</option>
+            </select>
+          </Field>
+
+          <Field
+            label="CRASH LOG / ERROR"
+            rightLinkText="Where do I find my crash log?"
+            onRightLinkClick={showCrashLogHelp}
+          >
+            <textarea
+              className="min-h-[220px] w-full resize-y rounded-xl border border-white/10 bg-black/30 px-4 py-3 font-mono text-sm outline-none focus:border-white/20"
+              value={crashLog}
+              onChange={(e) => setCrashLog(e.target.value)}
+              placeholder="Paste your Forge/Fabric/CurseForge crash report or latest.log here..."
+            />
+          </Field>
+        </div>
+
+        <div className="mt-6">
+          <button
+            className={[
+              "w-full rounded-xl px-5 py-4 text-lg font-semibold transition",
+              canRun && !running ? "bg-blue-600 hover:bg-blue-500" : "bg-blue-900/60 text-white/60",
+            ].join(" ")}
+            onClick={runDiagnostic}
+            disabled={!canRun || running}
+          >
+            {running ? "Running..." : "Run Diagnostic"}
+          </button>
+
+          <div className="mt-2 flex items-center justify-between text-sm text-white/70">
             <div>
-              <label className="block text-xs tracking-widest text-slate-400">
-                GAME TITLE
-              </label>
-              <input
-                className="mt-2 w-full rounded-lg border border-slate-800 bg-black px-4 py-3 text-white outline-none focus:border-slate-600"
-                placeholder="Warzone, Tarkov, Fortnite..."
-                value={gameTitle}
-                onChange={(e) => setGameTitle(e.target.value)}
-              />
+              {loadingLimit ? (
+                "Checking daily limit..."
+              ) : isPro ? (
+                "Pro: Unlimited"
+              ) : (
+                <>
+                  Free diagnostics left today: <span className="font-semibold">{remaining}</span> / {limit}
+                </>
+              )}
             </div>
 
-            <div>
-              <label className="block text-xs tracking-widest text-slate-400">
-                GPU MODEL
-              </label>
-              <input
-                className="mt-2 w-full rounded-lg border border-slate-800 bg-black px-4 py-3 text-white outline-none focus:border-slate-600"
-                placeholder="RTX 3070 / RX 6800"
-                value={gpuModel}
-                onChange={(e) => setGpuModel(e.target.value)}
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs tracking-widest text-slate-400">
-                DRIVER VERSION
-              </label>
-              <input
-                className="mt-2 w-full rounded-lg border border-slate-800 bg-black px-4 py-3 text-white outline-none focus:border-slate-600"
-                placeholder="551.86"
-                value={driverVersion}
-                onChange={(e) => setDriverVersion(e.target.value)}
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs tracking-widest text-slate-400">
-                GRAPHICS API MODE
-              </label>
-
-              {/* Accessible name fix: label is already present, plus aria-label */}
-              <select
-                aria-label="Graphics API Mode"
-                className="mt-2 w-full rounded-lg border border-slate-800 bg-black px-4 py-3 text-white outline-none focus:border-slate-600"
-                value={apiMode}
-                onChange={(e) => setApiMode(e.target.value as ApiMode)}
-              >
-                <option value="Auto Detect">Auto Detect</option>
-                <option value="DX11">DX11</option>
-                <option value="DX12">DX12</option>
-                <option value="Vulkan">Vulkan</option>
-              </select>
-            </div>
-
-            <div>
-              <label className="block text-xs tracking-widest text-slate-400">
-                CRASH LOG / ERROR
-              </label>
-              <textarea
-                className="mt-2 min-h-[170px] w-full rounded-lg border border-slate-800 bg-black px-4 py-3 text-white outline-none focus:border-slate-600"
-                placeholder="Paste crash log or error message..."
-                value={log}
-                onChange={(e) => setLog(e.target.value)}
-              />
-            </div>
-
-            <div className="pt-2">
+            {!isPro && (
               <button
-                onClick={handleAnalyze}
-                disabled={loading || isLimited || !log.trim()}
-                className="w-full rounded-lg bg-blue-600 px-5 py-4 text-lg font-semibold disabled:opacity-40"
+                type="button"
+                className="underline underline-offset-4 hover:text-white"
+                onClick={upgradeToPro}
               >
-                {loading
-                  ? "Running..."
-                  : isLimited
-                  ? "Daily Limit Reached"
-                  : "Run Diagnostic"}
+                Upgrade for unlimited (Pro)
               </button>
-
-              <div className="mt-2 flex items-center justify-between text-xs text-slate-400">
-                <span>
-                  Free diagnostics left today:{" "}
-                  <span className="text-slate-200">{remaining}</span> / {DAILY_LIMIT}
-                </span>
-
-                <span className="text-slate-300">
-                  Upgrade for unlimited (coming next)
-                </span>
-              </div>
-            </div>
+            )}
           </div>
 
-          {/* STEP 1: Top cause summary box */}
-          {prob?.top && (
-            <div className="mt-8 rounded-xl border border-slate-800 bg-slate-950 p-4">
-              <div className="text-xs tracking-widest text-slate-400">
-                TOP LIKELY CAUSE
-              </div>
-              <div className="mt-2 flex items-center justify-between gap-3">
-                <div className="text-lg font-semibold text-white">
-                  {prob.top.label}
-                </div>
-                <div className="rounded-full border border-slate-700 bg-black px-3 py-1 text-sm text-slate-200">
-                  {prob.top.value}%
-                </div>
-              </div>
-              <div className="mt-2 text-sm text-slate-300">
-                Based on the probability breakdown from your crash signal + context.
-              </div>
+          {errorMsg ? (
+            <div className="mt-4 rounded-xl border border-red-500/30 bg-red-950/40 p-4 text-sm text-red-100">
+              {errorMsg}
             </div>
-          )}
-
-          {/* Output */}
-          <pre className="mt-8 whitespace-pre-wrap rounded-xl border border-slate-800 bg-slate-950 p-5 text-sm text-slate-100">
-            {result || "Paste a crash log and run diagnostic to see results here."}
-          </pre>
+          ) : null}
         </div>
-      </div>
+      </section>
+
+      <section className="mt-6">
+        {result ? (
+          <div className="rounded-2xl border border-white/10 bg-[rgba(10,22,48,0.55)] p-5">
+            <div className="text-xs font-semibold tracking-widest text-white/70">RESULT</div>
+            <pre className="mt-3 whitespace-pre-wrap break-words rounded-xl bg-black/30 p-4 text-sm leading-relaxed">
+              {result}
+            </pre>
+          </div>
+        ) : (
+          <div className="rounded-2xl border border-white/10 bg-[rgba(10,22,48,0.35)] p-5 text-white/70">
+            Paste a crash log and run diagnostic to see results here.
+          </div>
+        )}
+      </section>
     </main>
+  );
+}
+
+function Field(props: {
+  label: string;
+  children: React.ReactNode;
+  rightLinkText?: string;
+  onRightLinkClick?: () => void;
+}) {
+  return (
+    <div className="grid gap-2">
+      <div className="flex items-center gap-3">
+        <div className="text-xs font-semibold tracking-widest text-white/70">{props.label}</div>
+        <div className="flex-1" />
+        {props.rightLinkText && props.onRightLinkClick ? (
+          <button
+            type="button"
+            onClick={props.onRightLinkClick}
+            className="text-xs text-white/70 underline underline-offset-4 hover:text-white"
+          >
+            {props.rightLinkText}
+          </button>
+        ) : null}
+      </div>
+      {props.children}
+    </div>
   );
 }
